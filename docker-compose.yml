@@ -1,25 +1,28 @@
-version: "3.9"
-
 services:
   backend:
     build:
       context: ./backend
     ports:
-      - "8000:8000"
-    env_file:
-      - ./backend/.env
+      - "127.0.0.1:8000:8000"
+    environment:
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      MEDRAG_DATA_DIR: /data
     volumes:
-      - ./backend/chroma_data:/app/backend/chroma_data
-      - ./backend/uploads:/app/backend/uploads
+      - medrag_dev_data:/data
     restart: unless-stopped
 
   frontend:
-    image: node:18-alpine
+    image: node:22-alpine
     working_dir: /app
     ports:
-      - "5173:5173"
+      - "127.0.0.1:5173:5173"
     volumes:
       - ./frontend:/app
-    command: sh -c "npm install && npm run dev -- --host 0.0.0.0 --port 5173"
+      - frontend_modules:/app/node_modules
+    command: sh -c "npm ci && npm run dev -- --host 0.0.0.0 --port 5173"
     depends_on:
       - backend
+
+volumes:
+  medrag_dev_data:
+  frontend_modules:

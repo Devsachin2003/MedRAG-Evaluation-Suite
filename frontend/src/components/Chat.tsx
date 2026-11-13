@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { apiUrl } from "../config/api";
 
 export type SourceChunk = {
@@ -32,6 +32,8 @@ export function Chat() {
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const requestRef = useRef<AbortController | null>(null);
+  useEffect(() => () => requestRef.current?.abort(), []);
 
   const scrollToBottom = () => {
     requestAnimationFrame(() => bottomRef.current?.scrollIntoView({ behavior: "smooth" }));
@@ -51,17 +53,22 @@ export function Chat() {
     scrollToBottom();
 
     const payload = {
-      messages: nextHistory.map((m) => ({ role: m.role, content: m.content })),
+      messages: [{ role: "user", content: trimmed }],
     };
 
     let assistantContent = "";
     let sources: SourceChunk[] = [];
+    const controller = new AbortController();
+    requestRef.current = controller;
+    const timeout = window.setTimeout(() => controller.abort(), 180000);
+    let completed = false;
 
     try {
       const res = await fetch(apiUrl("/api/chat/stream"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
+        signal: controller.signal,
       });
 
       if (!res.ok || !res.body) {
@@ -82,6 +89,8 @@ export function Chat() {
         for (const line of lines) {
           const parsed = parseSseData(line) as { type?: string; token?: string; sources?: SourceChunk[] } | null;
           if (!parsed || typeof parsed !== "object") continue;
+          if (parsed.type === "error") throw new Error("Generation failed");
+          if (parsed.type === "done") completed = true;
 
           if (parsed.type === "sources" && Array.isArray(parsed.sources)) {
             sources = parsed.sources;
@@ -98,6 +107,7 @@ export function Chat() {
           }
         }
       }
+      if (!completed) throw new Error("Incomplete stream");
     } catch {
       setMessages((prev) =>
         prev.map((m) =>
@@ -111,6 +121,9 @@ export function Chat() {
         )
       );
     } finally {
+      window.clearTimeout(timeout);
+      controller.abort();
+      requestRef.current = null;
       setStreaming(false);
       scrollToBottom();
     }
@@ -177,6 +190,7 @@ export function Chat() {
       <div className="border-t border-slate-100 p-4 sm:p-5">
         <div className="flex gap-2">
           <textarea
+            maxLength={8000}
             rows={2}
             value={input}
             onChange={(e) => setInput(e.target.value)}

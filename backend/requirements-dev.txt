@@ -1,2 +1,5 @@
-pytest==8.2.2
-ruff==0.5.5
+-c constraints.txt
+pytest>=9.0.3,<10
+httpx>=0.28,<1
+ruff>=0.11,<1
+pip-audit>=2.9,<3

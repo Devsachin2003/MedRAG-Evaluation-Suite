@@ -4,6 +4,12 @@ from __future__ import annotations
 
 import logging
 import os
+import math
+import tempfile
+import hashlib
+import json
+from datetime import datetime, timezone
+from importlib.metadata import version
 from pathlib import Path
 from typing import Any, Callable
 
@@ -16,6 +22,7 @@ from langchain_core.embeddings import Embeddings
 from langchain_groq import ChatGroq
 
 from app.rag_core import generate_grounded_response, retrieve_context
+from app import settings
 
 try:
     from ragas import evaluate
@@ -23,7 +30,7 @@ try:
     from ragas.llms import LangchainLLMWrapper
     from ragas.metrics import answer_relevancy, context_precision, faithfulness
 except ImportError as exc:  # pragma: no cover - import guard for user guidance
-    raise SystemExit(
+    raise RuntimeError(
         "ragas is not installed. Run: pip install ragas datasets pandas requests python-dotenv langchain-groq"
     ) from exc
 
@@ -32,7 +39,7 @@ logger = logging.getLogger(__name__)
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_OUTPUT_CSV = REPO_ROOT / "ragas_evaluation_results.csv"
+DEFAULT_OUTPUT_CSV = settings.OUTPUT_DIR / "ragas_evaluation_results.csv"
 
 TEST_CASES: list[dict[str, str]] = [
     {
@@ -85,7 +92,8 @@ def query_chat_api(api_url: str, question: str) -> dict[str, Any]:
     response = requests.post(
         f"{api_url.rstrip('/')}/chat",
         json={"query": question},
-        timeout=180,
+        timeout=(10, 180),
+        headers={"Authorization": f"Bearer {os.getenv('MEDRAG_API_KEY', '')}"},
     )
     response.raise_for_status()
     payload = response.json()
@@ -110,11 +118,15 @@ def query_local_pipeline(question: str) -> dict[str, Any]:
     return {
         "answer": answer,
         "sources": contexts,
-        "retrieved_contexts": [context.get("text", "") for context in contexts if context.get("text")],
+        "retrieved_contexts": [
+            context.get("text", "") for context in contexts if context.get("text")
+        ],
     }
 
 
-def build_runs(question_runner: Callable[[str], dict[str, Any]]) -> list[dict[str, Any]]:
+def build_runs(
+    question_runner: Callable[[str], dict[str, Any]],
+) -> list[dict[str, Any]]:
     runs: list[dict[str, Any]] = []
     for case in TEST_CASES:
         logger.info("Evaluating %s", case["id"])
@@ -135,7 +147,11 @@ def build_runs(question_runner: Callable[[str], dict[str, Any]]) -> list[dict[st
 def build_ragas_dataset(runs: list[dict[str, Any]]) -> Dataset:
     records: list[dict[str, Any]] = []
     for run in runs:
-        contexts = [context for context in run["retrieved_contexts"] if isinstance(context, str) and context.strip()]
+        contexts = [
+            context
+            for context in run["retrieved_contexts"]
+            if isinstance(context, str) and context.strip()
+        ]
         ground_truth = run["ground_truth"]
         answer = run["generated_answer"]
         question = run["question"]
@@ -163,18 +179,29 @@ def evaluate_with_ragas(dataset: Dataset) -> pd.DataFrame:
     groq_model = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 
     if not groq_api_key:
-        raise SystemExit("GROQ_API_KEY is missing. Put it in backend/.env or your environment before running this script.")
+        raise RuntimeError("GROQ_API_KEY is required for evaluation")
 
     evaluator_llm = LangchainLLMWrapper(
-        ChatGroq(api_key=groq_api_key, model=groq_model, temperature=0.0, streaming=False)
+        ChatGroq(
+            api_key=groq_api_key,
+            model=groq_model,
+            temperature=0.0,
+            streaming=False,
+            timeout=settings.LLM_TIMEOUT_SECONDS,
+            max_retries=1,
+            max_tokens=2048,
+        )
     )
     evaluator_embeddings = LangchainEmbeddingsWrapper(ChromaDefaultEmbeddings())
+
+    from ragas.run_config import RunConfig
 
     result = evaluate(
         dataset=dataset,
         metrics=[context_precision, faithfulness, answer_relevancy],
         llm=evaluator_llm,
         embeddings=evaluator_embeddings,
+        run_config=RunConfig(timeout=120, max_retries=1, max_workers=2),
     )
 
     if hasattr(result, "to_pandas"):
@@ -185,24 +212,37 @@ def evaluate_with_ragas(dataset: Dataset) -> pd.DataFrame:
     return pd.DataFrame(result)
 
 
-def write_csv(runs: list[dict[str, Any]], scores_df: pd.DataFrame, output_csv: Path) -> pd.DataFrame:
+def write_csv(
+    runs: list[dict[str, Any]], scores_df: pd.DataFrame, output_csv: Path
+) -> pd.DataFrame:
+    if not runs or len(scores_df) != len(runs):
+        raise ValueError("Evaluation scores do not align with test cases")
+    required_metrics = {"context_precision", "faithfulness", "answer_relevancy"}
+    if not required_metrics.issubset(scores_df.columns):
+        raise ValueError("Evaluation result is missing metrics")
     base_df = pd.DataFrame(runs)
-    
+
     # Ensure indices are clean and aligned
     base_df = base_df.reset_index(drop=True)
     scores_df = scores_df.reset_index(drop=True)
-    
+
     # Remove any duplicate columns from scores_df
-    scores_df = scores_df.loc[:, ~scores_df.columns.duplicated(keep='first')]
-    
+    scores_df = scores_df.loc[:, ~scores_df.columns.duplicated(keep="first")]
+
     # Only keep metric columns from scores_df
-    metric_columns = [col for col in scores_df.columns if col in {"context_precision", "faithfulness", "answer_relevancy"}]
+    metric_columns = [
+        col
+        for col in scores_df.columns
+        if col in {"context_precision", "faithfulness", "answer_relevancy"}
+    ]
     scores_df = scores_df[metric_columns]
-    
+    scores_df = scores_df.apply(pd.to_numeric, errors="coerce")
+    scores_df = scores_df.where((scores_df >= 0) & (scores_df <= 1))
+
     # Combine horizontally
     combined = pd.concat([base_df, scores_df], axis=1)
-    combined = combined.loc[:, ~combined.columns.duplicated(keep='first')]
-    
+    combined = combined.loc[:, ~combined.columns.duplicated(keep="first")]
+
     # Build summary row
     summary_row = {}
     for col in combined.columns:
@@ -214,13 +254,32 @@ def write_csv(runs: list[dict[str, Any]], scores_df: pd.DataFrame, output_csv: P
             summary_row[col] = "AVERAGE"
         else:
             summary_row[col] = ""
-    
+
     # Create summary dataframe ensuring same columns as combined
     summary_df = pd.DataFrame([summary_row], columns=combined.columns)
-    
+
     # Append summary row
     final_df = pd.concat([combined, summary_df], axis=0, ignore_index=True)
-    final_df.to_csv(output_csv, index=False)
+    # Escape spreadsheet formulas only in the exported artifact, not scoring data.
+    export_df = final_df.map(
+        lambda value: (
+            "'" + value
+            if isinstance(value, str)
+            and value.lstrip().startswith(("=", "+", "-", "@"))
+            else value
+        )
+    )
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(dir=output_csv.parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            export_df.to_csv(handle, index=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, output_csv)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
     return final_df
 
 
@@ -240,12 +299,43 @@ def run_medrag_evaluation(
     summary_row = final_df[final_df["case_id"] == "summary"].iloc[0].to_dict()
     case_rows = final_df[final_df["case_id"] != "summary"].to_dict(orient="records")
 
-    return {
-        "summary": {
-            "context_precision": float(summary_row.get("context_precision", 0.0) or 0.0),
-            "faithfulness": float(summary_row.get("faithfulness", 0.0) or 0.0),
-            "answer_relevancy": float(summary_row.get("answer_relevancy", 0.0) or 0.0),
-        },
-        "cases": case_rows,
-        "output_csv": str(output_path.resolve()),
-    }
+    return json_safe(
+        {
+            "provenance": {
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "model": os.getenv("GROQ_MODEL", "llama-3.1-8b-instant"),
+                "ragas_version": version("ragas"),
+                "test_cases_sha256": hashlib.sha256(
+                    json.dumps(TEST_CASES, sort_keys=True).encode()
+                ).hexdigest(),
+                "retrieved_contexts_sha256": hashlib.sha256(
+                    json.dumps(
+                        [run["retrieved_contexts"] for run in runs], sort_keys=True
+                    ).encode()
+                ).hexdigest(),
+                "case_count": len(runs),
+            },
+            "summary": {
+                "context_precision": summary_row.get("context_precision"),
+                "faithfulness": summary_row.get("faithfulness"),
+                "answer_relevancy": summary_row.get("answer_relevancy"),
+            },
+            "metric_valid_counts": {
+                name: int(final_df.iloc[:-1][name].notna().sum())
+                for name in ("context_precision", "faithfulness", "answer_relevancy")
+            },
+            "cases": case_rows,
+            "output_csv": str(output_path.resolve()),
+        }
+    )
+
+
+def json_safe(value):
+    """Unavailable scores remain null, never a misleading zero or invalid JSON NaN."""
+    if isinstance(value, dict):
+        return {key: json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [json_safe(item) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value

@@ -21,3 +21,9 @@ frontend/.env.local
 .idea/
 .vscode/
 *.swp
+backend/data/
+deploy/*.htpasswd
+.env.production
+.pytest_cache/
+.ruff_cache/
+*.tsbuildinfo

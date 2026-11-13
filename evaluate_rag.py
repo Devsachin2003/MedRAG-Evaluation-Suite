@@ -29,14 +29,18 @@ DEFAULT_API_URL = os.getenv("MEDRAG_API_URL", "http://127.0.0.1:8000")
 def configure_logging() -> None:
     """Configure the script logger for command-line evaluation runs."""
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
+    )
 
 
 def main() -> None:
     """Run the MedRAG evaluation workflow against the configured backend."""
 
     parser = argparse.ArgumentParser(description="Run MedRAG evaluation with ragas.")
-    parser.add_argument("--api-url", default=DEFAULT_API_URL, help="Base URL for the FastAPI backend.")
+    parser.add_argument(
+        "--api-url", default=DEFAULT_API_URL, help="Base URL for the FastAPI backend."
+    )
     parser.add_argument(
         "--output-csv",
         default=str(DEFAULT_OUTPUT_CSV),
@@ -53,10 +57,10 @@ def main() -> None:
     summary = result["summary"]
     logging.info("Saved evaluation results to %s", result["output_csv"])
     logging.info(
-        "Context Precision: %.4f | Answer Faithfulness: %.4f | Answer Relevancy: %.4f",
-        float(summary.get("context_precision", 0.0) or 0.0),
-        float(summary.get("faithfulness", 0.0) or 0.0),
-        float(summary.get("answer_relevancy", 0.0) or 0.0),
+        "Context Precision: %s | Answer Faithfulness: %s | Answer Relevancy: %s",
+        summary.get("context_precision"),
+        summary.get("faithfulness"),
+        summary.get("answer_relevancy"),
     )
 
 

@@ -2,9 +2,9 @@ import { useMemo, useState } from "react";
 import { apiUrl } from "../config/api";
 
 type EvalSummary = {
-  context_precision: number;
-  faithfulness: number;
-  answer_relevancy: number;
+  context_precision: number | null;
+  faithfulness: number | null;
+  answer_relevancy: number | null;
   output_csv?: string;
 };
 
@@ -20,9 +20,9 @@ type TestCaseRow = {
 };
 
 const EMPTY_SUMMARY: EvalSummary = {
-  context_precision: 0,
-  faithfulness: 0,
-  answer_relevancy: 0,
+  context_precision: null,
+  faithfulness: null,
+  answer_relevancy: null,
 };
 
 function MetricCard({
@@ -35,9 +35,9 @@ function MetricCard({
 }: {
   title: string;
   subtitle: string;
-  value: number;
+  value: number | null;
   suffix: string;
-  barPct: number;
+  barPct: number | null;
   tone: "sky" | "emerald" | "amber";
 }) {
   const tones = {
@@ -51,13 +51,13 @@ function MetricCard({
       <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">{title}</p>
       <p className="mt-1 text-sm text-slate-600">{subtitle}</p>
       <div className="mt-4 flex items-baseline gap-1">
-        <span className="font-display text-4xl font-bold tabular-nums text-ink-900">{value}</span>
-        <span className="text-lg font-medium text-slate-500">{suffix}</span>
+        <span className="font-display text-4xl font-bold tabular-nums text-ink-900">{value ?? "N/A"}</span>
+        <span className="text-lg font-medium text-slate-500">{value == null ? "" : suffix}</span>
       </div>
       <div className="mt-4 h-2 overflow-hidden rounded-full bg-slate-100">
         <div
           className={`h-full rounded-full bg-gradient-to-r ${tones[tone]} transition-[width] duration-700`}
-          style={{ width: `${Math.min(100, Math.max(0, barPct))}%` }}
+          style={{ width: `${Math.min(100, Math.max(0, barPct ?? 0))}%` }}
         />
       </div>
     </div>
@@ -92,7 +92,8 @@ export function EvalDashboard() {
   const [error, setError] = useState<string | null>(null);
 
   const percent = useMemo(() => {
-    const toPct = (value: number) => Math.round(Math.max(0, Math.min(1, value)) * 100);
+    const toPct = (value: number | null) => value == null || !Number.isFinite(value)
+      ? null : Math.round(Math.max(0, Math.min(1, value)) * 100);
     return {
       contextPrecision: toPct(summary.context_precision),
       faithfulness: toPct(summary.faithfulness),
@@ -114,8 +115,8 @@ export function EvalDashboard() {
         throw new Error(`HTTP ${response.status}`);
       }
 
-      const payload = (await response.json()) as { summary?: EvalSummary; cases?: TestCaseRow[] };
-      if (payload.summary) setSummary(payload.summary);
+      const payload = (await response.json()) as { summary?: EvalSummary; cases?: TestCaseRow[]; output_csv?: string };
+      if (payload.summary) setSummary({ ...payload.summary, output_csv: payload.output_csv });
       if (Array.isArray(payload.cases)) setCases(payload.cases);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Evaluation failed.");
@@ -205,9 +206,9 @@ export function EvalDashboard() {
                     <td className="max-w-xs px-4 py-3 align-top text-slate-800">{row.question}</td>
                     <td className="max-w-xs px-4 py-3 align-top text-slate-600">{row.ground_truth}</td>
                     <td className="max-w-xs px-4 py-3 align-top text-slate-700">{row.generated_answer}</td>
-                    <td className="px-4 py-3 align-top text-slate-700">{Math.round((row.context_precision ?? 0) * 100)}%</td>
-                    <td className="px-4 py-3 align-top text-slate-700">{Math.round((row.faithfulness ?? 0) * 100)}%</td>
-                    <td className="px-4 py-3 align-top text-slate-700">{Math.round((row.answer_relevancy ?? 0) * 100)}%</td>
+                    <td className="px-4 py-3 align-top text-slate-700">{row.context_precision == null ? "N/A" : `${Math.round(row.context_precision * 100)}%`}</td>
+                    <td className="px-4 py-3 align-top text-slate-700">{row.faithfulness == null ? "N/A" : `${Math.round(row.faithfulness * 100)}%`}</td>
+                    <td className="px-4 py-3 align-top text-slate-700">{row.answer_relevancy == null ? "N/A" : `${Math.round(row.answer_relevancy * 100)}%`}</td>
                     <td className="px-4 py-3 align-top">
                       <SourceList sources={row.retrieved_contexts} />
                     </td>

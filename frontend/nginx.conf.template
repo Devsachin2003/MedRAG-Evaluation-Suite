@@ -1,0 +1,27 @@
+limit_req_zone $binary_remote_addr zone=api:10m rate=10r/m;
+server {
+    listen 8080;
+    server_tokens off;
+    root /usr/share/nginx/html;
+    auth_basic "MedRAG";
+    auth_basic_user_file /etc/nginx/medrag.htpasswd;
+    client_max_body_size 11m;
+    client_body_timeout 30s;
+    add_header X-Content-Type-Options nosniff always;
+    add_header X-Frame-Options DENY always;
+    add_header Referrer-Policy no-referrer always;
+    add_header Content-Security-Policy "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; img-src 'self' data:; font-src 'self'; frame-ancestors 'none'" always;
+    location ~ ^/(api/|chat$|ingest$|health$|live$|version$) {
+        limit_req zone=api burst=5 nodelay;
+        limit_req_status 429;
+        proxy_pass http://backend:8000;
+        proxy_set_header Authorization "Bearer ${MEDRAG_API_KEY}";
+        proxy_set_header Host $host;
+        proxy_buffering off;
+        proxy_read_timeout 900s;
+        proxy_send_timeout 30s;
+    }
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+}

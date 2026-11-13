@@ -1,181 +1,134 @@
 # MedRAG Evaluation Suite
 
-MedRAG Evaluation Suite is a medical retrieval-augmented generation (RAG) demo built to show a complete applied AI engineering workflow:
+A FastAPI and React application for evaluating retrieval-augmented answers against a shared medical-document corpus. Upload PDF, TXT, or Markdown documents, retrieve evidence using Chroma vector search plus BM25, generate grounded answers with Groq, and score a PPCM benchmark with Ragas.
 
-- ingesting documents into a persistent vector store
-- retrieving context with a hybrid search strategy
-- generating grounded answers with Groq-hosted LLMs
-- evaluating the system with ragas and exporting reproducible CSV results
+This is a research evaluation tool. The bundled three-case benchmark is a demonstration, not clinical validation. See [production operations](docs/production.md) for the deployment boundary and outstanding release gates.
 
-## Architecture Overview
+## Architecture
 
-The repository is split into a small FastAPI backend and a React frontend:
-
-- **FastAPI** powers the backend API, ingestion routes, chat endpoints, and the evaluation route.
-- **LangChain** provides the document splitting, retrieval orchestration, and Groq model integration.
-- **ChromaDB** stores embedded document chunks for semantic retrieval.
-- **BM25** provides keyword-based retrieval to complement vector search.
-- **EnsembleRetriever** combines both retrievers so the system can balance semantic and lexical signals.
-- **Groq** provides the chat and evaluation LLMs used by the app.
-- **ragas** computes the evaluation metrics and writes a summary CSV for inspection.
-
-At a high level, the flow is:
-
-1. Documents are uploaded through the backend.
-2. Text is extracted, chunked, and stored in ChromaDB with chunk-level duplicate protection.
-3. A query triggers hybrid retrieval through vector search and BM25.
-4. Retrieved chunks are passed to Groq for grounded answer generation.
-5. The evaluation harness runs a fixed benchmark set, collects answers and contexts, and scores them with ragas.
-
-## 🧠 System Architecture
-
-```mermaid
-graph TD
-    A[User/Evaluator] -->|Submits Query| B(FastAPI Backend)
-    B --> C{ChromaDB}
-    C -->|Retrieves Context| D[Medical Document Vector Store]
-    D --> B
-    B --> E[LLM Generation]
-    E --> F[Evaluation Metrics]
-    F -->|Returns Score| A
+```text
+Browser -> authenticated Nginx -> FastAPI
+                                 |-> bounded document parsing -> Chroma
+                                 |-> vector + BM25 retrieval -> Groq -> SSE
+                                 |-> benchmark -> Ragas -> atomic CSV reports
 ```
-## Repository Layout
 
-- `backend/main.py` - FastAPI application and API routes.
-- `backend/app/rag_core.py` - ingestion, retrieval, and grounded generation logic.
-- `backend/app/eval_core.py` - shared evaluation harness used by the API and CLI.
-- `evaluate_rag.py` - command-line entry point for running the evaluation pipeline.
-- `frontend/` - React UI for ingestion, chat, and evaluation.
+The backend uses one process and one shared corpus. Ingestion is serialized and content-hash deduplicated. Blocking parsing, retrieval, and evaluation run off the HTTP event loop. The API limits request size and concurrent pipeline work. Production authentication uses browser Basic Auth at Nginx and a separate bearer credential between Nginx and the private backend.
 
-## Prerequisites
+## Local development
 
-- Python 3.10+
-- Node.js 18+
-- A Groq API key available in your environment
-
-## Backend Setup
-
-Create a virtual environment and install dependencies:
+Use Python 3.11 and Node 22, or Docker Compose v2. Set your Groq key in a root `.env` for Compose; for native Python use `backend/.env` or exported environment variables. Never commit live secrets.
 
 ```bash
+cp .env.example .env
+# Set GROQ_API_KEY in .env
+docker compose up --build
+```
+
+Open http://localhost:5173. The local API is at http://127.0.0.1:8000, with interactive docs at `/docs`. Initial startup downloads the embedding model and fails if warmup cannot complete. Local ports bind to loopback.
+
+For native development:
+
+```bash
+python3.11 -m venv .venv
+. .venv/bin/activate
+pip install -r backend/requirements.txt -r backend/requirements-dev.txt
 cd backend
-pip install -r requirements.txt
+uvicorn main:app --host 127.0.0.1 --port 8000
 ```
 
-Set the required environment variables in `backend/.env` or your shell environment:
-
-```bash
-GROQ_API_KEY=your_groq_api_key
-GROQ_MODEL=llama-3.1-8b-instant
-```
-
-Run the backend with Uvicorn:
-
-```bash
-cd backend
-uvicorn main:app --reload --host 127.0.0.1 --port 8000
-```
-
-The backend exposes:
-
-- `GET /health`
-- `POST /ingest`
-- `POST /chat`
-- `POST /api/evaluation/run`
-- `POST /api/ingest/upload`
-- `POST /api/chat/stream`
-
-## Frontend Setup
-
-Install and run the frontend from the `frontend/` directory:
+In another terminal:
 
 ```bash
 cd frontend
-npm install
+npm ci
 npm run dev
 ```
 
-By default, the frontend uses `http://localhost:8000` for API calls in local development.
+## API
 
-## Dependency Locking (Optional)
-
-If you want a reproducible lock file for Python dependencies, run:
+When `MEDRAG_API_KEY` is configured, send `Authorization: Bearer <key>` to protected backend routes. The production browser receives no backend key; Nginx injects it after authenticating the user.
 
 ```bash
-pip install pip-tools
-pip-compile backend/requirements.txt -o backend/requirements-frozen.txt
+curl -F 'file=@guideline.pdf' http://127.0.0.1:8000/api/ingest/upload
+curl -H 'Content-Type: application/json' \
+  -d '{"query":"What limitations does the guideline describe?"}' \
+  http://127.0.0.1:8000/chat
+curl -N -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"Summarize the uploaded evidence."}]}' \
+  http://127.0.0.1:8000/api/chat/stream
+curl -H 'Content-Type: application/json' -d '{}' \
+  http://127.0.0.1:8000/api/evaluation/run
 ```
 
-## Production Deployment
+- `/live`: process liveness; `/health`: vector-store readiness; `/version`: release version.
+- `/ingest`: PDF-only compatibility endpoint. `/api/ingest/upload`: PDF/TXT/MD.
+- `/chat`: bounded query, answer, and evidence sources. No evidence yields an explicit insufficient-evidence answer without calling Groq.
+- `/api/chat/stream`: emits `sources`, `token`, then `done`; a failed stream emits `error` instead of `done`. It uses the last user question, not conversational memory.
+- `/api/evaluation/run`: one evaluation at a time; optional `output_csv` must be a safe `.csv` basename. Each report gets a unique suffix. The response contains scores, valid-score counts, model/version/corpus hashes, and a report basename.
 
-Deploy the backend and frontend separately:
+Validation failures return 422, invalid documents 400, oversized requests 413, unsupported uploads 415, authentication failures 401, overlapping evaluations 409, and capacity exhaustion 503. Streaming errors occur inside the SSE response after headers have been sent. Unexpected exceptions return generic errors with a request ID; application logs omit query text and document snippets.
 
-- **Backend:** Render Web Service built from `backend/Dockerfile`
-- **Frontend:** Vercel project built from `frontend/`
+## Evaluation integrity
 
-Set the following environment variables in your hosting dashboards:
+Metrics are context precision, faithfulness, and answer relevancy. Scores outside `[0, 1]` and non-finite scores become unavailable (`null` in JSON, `N/A` in the UI). Averages exclude unavailable scores and the response reports valid-score counts. A missing metric column or row-count mismatch fails evaluation. CSV writes use atomic replacement, and spreadsheet formula prefixes are escaped in exports.
 
-- **Render (backend)**
-  - `GROQ_API_KEY` (required)
-  - `GROQ_MODEL` (optional, defaults to `llama-3.1-8b-instant`)
-- **Vercel (frontend)**
-  - `VITE_API_URL` (**must be set in production**), point it to your deployed Render backend
-    base URL (for example `https://medrag-backend.onrender.com`).
-    If omitted, the frontend falls back to `http://localhost:8000`, which is only intended for
-    local development.
-
-ChromaDB persistence in production relies on the Render persistent disk configured in `render.yaml`,
-mounted at `backend/chroma_data` (`/app/chroma_data` in the container).
-
-## Running the Evaluation
-
-There are two equivalent ways to run the benchmark:
-
-### 1. Command line
-
-From the repository root:
+Run the same harness from the CLI:
 
 ```bash
-python evaluate_rag.py
+python evaluate_rag.py --api-url http://127.0.0.1:8000 --output-csv report.csv
 ```
 
-This queries the live backend, evaluates the configured test cases, and writes `ragas_evaluation_results.csv` at the repository root by default.
+The CLI path is operator-controlled; only HTTP output paths are restricted. Scores depend on the selected model and corpus. Replace the demonstration cases with independently reviewed references before using scores as release criteria. Retrieved text is sent to Groq for generation and evaluation.
 
-### 2. API / UI
+## Tests and CI
 
-Run the backend, open the frontend, and use the Evaluation Dashboard to trigger the same shared evaluation harness.
+```bash
+pip install -r backend/requirements.txt -r backend/requirements-dev.txt
+python -m pytest backend/tests -q
+ruff check backend --select E9,F63,F7,F82
+pip check
+pip-audit --progress-spinner off
+cd frontend
+npm ci
+npm run build
+npm run lint
+npm audit
+```
 
-## ragas Metrics Used
+Tests use temporary Chroma databases and deterministic embeddings; no Groq credentials or embedding downloads are needed. They cover API validation/authentication, request limits, safe errors, SSE failures, ingestion deduplication/concurrency, and evaluation output integrity. They do not establish live-model answer quality.
 
-The evaluation suite uses three ragas metrics:
+GitHub Actions runs Python tests, frontend build/lint, dependency audits, and container builds. The audit gate deliberately fails for unresolved upstream advisories. Python versions are constrained by `backend/constraints.txt`; npm uses the committed lockfile. Update and re-audit both before dependency changes.
 
-- **Context Precision** - measures how much of the retrieved context is actually relevant to the question.
-- **Faithfulness** - measures whether the answer stays grounded in the retrieved context instead of hallucinating unsupported claims.
-- **Answer Relevancy** - measures how directly the generated answer addresses the user question.
+## Production deployment
 
-These metrics are written to the CSV output for both per-case inspection and summary reporting.
+See [the runbook](docs/production.md) for setup, migration, backups, recovery, and release blockers. The standalone `docker-compose.prod.yml` builds a non-root backend and a static Nginx frontend, persists `/data` and the embedding cache, and exposes only `127.0.0.1:8080`. Put a TLS ingress in front before remote access.
 
-## Demo Notes
+```bash
+mkdir -p deploy
+htpasswd -cB deploy/medrag.htpasswd operator
+export MEDRAG_API_KEY="$(openssl rand -hex 32)"
+export GROQ_API_KEY="your-provider-key"
+docker compose -f docker-compose.prod.yml up --build -d
+docker compose -f docker-compose.prod.yml ps
+```
 
-This project is intentionally structured so the evaluation story is easy to show on screen:
+Use a secret manager or protected environment file to preserve deployment credentials between invocations. Docker Compose stores data in named volumes; `down` preserves them, while `down -v` deletes them.
 
-- live RAG pipeline with ingestion and chat
-- reproducible evaluation output in CSV form
-- visible hybrid retrieval configuration
-- a compact benchmark set for fast demo runs
+## Configuration
 
-## Troubleshooting
+| Variable | Default / purpose |
+| --- | --- |
+| `APP_ENV` | `development`; `production` validates credentials at startup |
+| `MEDRAG_API_KEY` | Optional locally; production requires 32-128 URL-safe characters |
+| `GROQ_API_KEY`, `GROQ_MODEL` | Provider credential and model; default `llama-3.1-8b-instant` |
+| `MEDRAG_DATA_DIR` | Native `backend/data`; container `/data` |
+| `RETAIN_UPLOADS` | `false`; opt in to storing original uploaded bytes |
+| `MAX_UPLOAD_BYTES` | 10 MiB; bounded reads and total-body middleware |
+| `MAX_TEXT_CHARS`, `MAX_PDF_PAGES` | 2,000,000 extracted characters / 500 pages |
+| `MAX_CORPUS_CHUNKS` | 20,000; bounds in-memory BM25 corpus loading |
+| `MAX_CONCURRENT_REQUESTS` | 4 pipeline requests per worker |
+| `LLM_TIMEOUT_SECONDS` | 60 per provider request; one retry, 2048 output tokens |
+| `CORS_ORIGINS` | Local Vite origins; comma-separated explicit origins |
 
-- If the backend reports that the Groq key is missing, confirm the environment variable is set before starting the server.
-
-## 📬 Let's Connect
-
-I'm actively building in the AI/ML space and am always open to feedback, collaboration, or discussing agentic workflows and RAG architectures. 
-
-* **LinkedIn:** [https://www.linkedin.com/in/devsachinsg19/]
-* **GitHub:** [https://github.com/Devsachin2003]
-* **Email:** [devsachin2003@gmail.com]
-
-If you found this evaluation suite helpful, consider giving the repository a ⭐!
-- If evaluation fails, make sure the backend is running and reachable at the URL passed to `evaluate_rag.py`.
-- If you reset the vector store, delete `backend/chroma_data/` and re-ingest your documents.
+Raw upload retention being disabled does not remove extracted document text from Chroma or reports. Treat both stores as sensitive. Authentication is shared-corpus access control, not per-user document isolation.

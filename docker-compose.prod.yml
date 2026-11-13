@@ -1,0 +1,46 @@
+services:
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    init: true
+    environment:
+      APP_ENV: production
+      GROQ_API_KEY: ${GROQ_API_KEY:?Set GROQ_API_KEY}
+      GROQ_MODEL: ${GROQ_MODEL:-llama-3.1-8b-instant}
+      MEDRAG_API_KEY: ${MEDRAG_API_KEY:?Set a random MEDRAG_API_KEY of at least 32 characters}
+      MEDRAG_DATA_DIR: /data
+      RETAIN_UPLOADS: "false"
+      ANONYMIZED_TELEMETRY: "false"
+    volumes:
+      - medrag_data:/data
+      - embedding_cache:/home/app/.cache
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 4g
+    cpus: 2
+    pids_limit: 256
+    stop_grace_period: 120s
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: "3"}
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    environment:
+      MEDRAG_API_KEY: ${MEDRAG_API_KEY:?Set MEDRAG_API_KEY}
+      NGINX_ENVSUBST_FILTER: MEDRAG_API_KEY
+    ports: ["127.0.0.1:8080:8080"]
+    volumes:
+      - ./deploy/medrag.htpasswd:/etc/nginx/medrag.htpasswd:ro
+    depends_on:
+      backend:
+        condition: service_healthy
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: "3"}
+volumes:
+  medrag_data:
+  embedding_cache:
